@@ -57,6 +57,7 @@ class GaussianModel:
                  add_opacity_dist : bool = False,
                  add_cov_dist : bool = False,
                  add_color_dist : bool = False,
+                 sonata_feat_dim: int=1088,
                  ):
 
         self.feat_dim = feat_dim
@@ -73,6 +74,8 @@ class GaussianModel:
         self.add_opacity_dist = add_opacity_dist
         self.add_cov_dist = add_cov_dist
         self.add_color_dist = add_color_dist
+
+        self.sonata_feat_dim = sonata_feat_dim
 
         self._anchor = torch.empty(0)
         self._offset = torch.empty(0)
@@ -127,6 +130,36 @@ class GaussianModel:
             nn.Sigmoid()
         ).cuda()
 
+        self.mlp_anchor_color = nn.Sequential(
+            nn.Linear(feat_dim,feat_dim / 2),
+            nn.ReLU(True),
+            nn.Linear(feat_dim / 2, 3),
+            nn.Sigmoid()
+        ).cuda()
+
+        self.mlp_anchor_noramls = nn.Sequential(
+            nn.Linear(feat_dim,feat_dim / 2),
+            nn.ReLU(True),
+            nn.Linear(feat_dim / 2, 3),
+            nn.Tanh()
+        ).cuda()
+
+        self.mlp_sonata_feat_to_anchor = nn.Sequential(
+            nn.Linear(sonata_feat_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(True),
+
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(True),
+
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(True),
+            nn.Linear(128, feat_dim),
+        ).cuda()
+
+
 
     def eval(self):
         self.mlp_opacity.eval()
@@ -137,6 +170,10 @@ class GaussianModel:
         if self.use_feat_bank:
             self.mlp_feature_bank.eval()
 
+        self.mlp_anchor_noramls.eval()
+        self.mlp_anchor_color.eval()
+        self.mlp_sonata_feat_to_anchor.eval()        
+
     def train(self):
         self.mlp_opacity.train()
         self.mlp_cov.train()
@@ -145,6 +182,10 @@ class GaussianModel:
             self.embedding_appearance.train()
         if self.use_feat_bank:                   
             self.mlp_feature_bank.train()
+
+        self.mlp_anchor_noramls.train()
+        self.mlp_anchor_color.train()
+        self.mlp_sonata_feat_to_anchor.train()
 
     def capture(self):
         return (
@@ -203,6 +244,18 @@ class GaussianModel:
     @property
     def get_color_mlp(self):
         return self.mlp_color
+    
+    @property
+    def get_anchor_color_mlp(self):
+        return self.mlp_anchor_color
+    
+    @property
+    def get_anchor_normals_mlp(self):
+        return self.mlp_anchor_noramls
+    
+    @property
+    def get_sonata_feat_to_anchor_mlp(self):
+        return self.mlp_sonata_feat_to_anchor
     
     @property
     def get_rotation(self):
@@ -324,6 +377,10 @@ class GaussianModel:
                 {'params': self.mlp_opacity.parameters(), 'lr': training_args.mlp_opacity_lr_init, "name": "mlp_opacity"},
                 {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
                 {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
+
+                {'params': self.mlp_anchor_color.parameters(), 'lr': training_args.mlp_anchor_color_lr_init, "name": "mlp_anchor_color"},
+                {'params': self.mlp_anchor_noramls.parameters(), 'lr': training_args.mlp_anchor_normals_lr_init, "name": "mlp_anchor_normals"},
+                {'params': self.mlp_sonata_feat_to_anchor.parameters(), 'lr': training_args.mlp_sonata_feat_to_anchor_lr_init, "name": "mlp_sonata_feat_to_anchor"},
             ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
@@ -350,6 +407,20 @@ class GaussianModel:
                                                     lr_final=training_args.mlp_color_lr_final,
                                                     lr_delay_mult=training_args.mlp_color_lr_delay_mult,
                                                     max_steps=training_args.mlp_color_lr_max_steps)
+        
+        self.mlp_anchor_color_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_anchor_color_lr_init,
+                                                        lr_final=training_args.mlp_anchor_color_lr_final,
+                                                        lr_delay_mult=training_args.mlp_anchor_color_lr_delay_mult,
+                                                        max_steps=training_args.mlp_anchor_color_lr_max_steps)
+        self.mlp_anchor_normals_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_anchor_normals_lr_init,    
+                                                        lr_final=training_args.mlp_anchor_normals_lr_final,
+                                                        lr_delay_mult=training_args.mlp_anchor_normals_lr_delay_mult,
+                                                        max_steps=training_args.mlp_anchor_normals_lr_max_steps)
+        self.mlp_sonata_feat_to_anchor_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_sonata_feat_to_anchor_lr_init,
+                                                        lr_final=training_args.mlp_sonata_feat_to_anchor_lr_final,
+                                                        lr_delay_mult=training_args.mlp_sonata_feat_to_anchor_lr_delay_mult,
+                                                        max_steps=training_args.mlp_sonata_feat_to_anchor_lr_max_steps)
+        
         if self.use_feat_bank:
             self.mlp_featurebank_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_featurebank_lr_init,
                                                         lr_final=training_args.mlp_featurebank_lr_final,
@@ -384,6 +455,15 @@ class GaussianModel:
                 param_group['lr'] = lr
             if self.appearance_dim > 0 and param_group["name"] == "embedding_appearance":
                 lr = self.appearance_scheduler_args(iteration)
+                param_group['lr'] = lr
+            if param_group['name'] == "mlp_anchor_color":
+                lr = self.mlp_anchor_color_scheduler_args(iteration)
+                param_group['lr'] = lr
+            if param_group['name'] == "mlp_anchor_normals":
+                lr = self.mlp_anchor_normals_scheduler_args(iteration)
+                param_group['lr'] = lr
+            if param_group['name'] == "mlp_sonata_feat_to_anchor":
+                lr = self.mlp_sonata_feat_to_anchor_scheduler_args(iteration)
                 param_group['lr'] = lr
             
             
@@ -752,6 +832,22 @@ class GaussianModel:
             color_mlp.save(os.path.join(path, 'color_mlp.pt'))
             self.mlp_color.train()
 
+            self.mlp_anchor_color.eval()
+            anchor_color_mlp = torch.jit.trace(self.mlp_anchor_color, (torch.rand(1, self.feat_dim).cuda()))
+            anchor_color_mlp.save(os.path.join(path, 'anchor_color_mlp.pt'))
+            self.mlp_anchor_color.train()
+
+            self.mlp_anchor_noramls.eval()
+            anchor_normals_mlp = torch.jit.trace(self.mlp_anchor_noramls, (torch.rand(1, self.feat_dim).cuda()))
+            anchor_normals_mlp.save(os.path.join(path, 'anchor_normals_mlp.pt'))
+            self.mlp_anchor_noramls.train()
+
+            self.mlp_sonata_feat_to_anchor.eval()
+            sonata_feat_to_anchor_mlp = torch.jit.trace(self.mlp_sonata_feat_to_anchor, (torch.rand(1, self.sonata_feat_dim).cuda()))
+            sonata_feat_to_anchor_mlp.save(os.path.join(path, 'sonata_feat_to_anchor_mlp.pt'))
+            self.mlp_sonata_feat_to_anchor.train()
+
+
             if self.use_feat_bank:
                 self.mlp_feature_bank.eval()
                 feature_bank_mlp = torch.jit.trace(self.mlp_feature_bank, (torch.rand(1, 3+1).cuda()))
@@ -785,6 +881,9 @@ class GaussianModel:
                     'opacity_mlp': self.mlp_opacity.state_dict(),
                     'cov_mlp': self.mlp_cov.state_dict(),
                     'color_mlp': self.mlp_color.state_dict(),
+                    'anchor_color_mlp': self.mlp_anchor_color.state_dict(),
+                    'anchor_normals_mlp': self.mlp_anchor_noramls.state_dict(),
+                    'sonata_feat_to_anchor_mlp': self.mlp_sonata_feat_to_anchor.state_dict()
                     }, os.path.join(path, 'checkpoints.pth'))
         else:
             raise NotImplementedError
@@ -795,6 +894,11 @@ class GaussianModel:
             self.mlp_opacity = torch.jit.load(os.path.join(path, 'opacity_mlp.pt')).cuda()
             self.mlp_cov = torch.jit.load(os.path.join(path, 'cov_mlp.pt')).cuda()
             self.mlp_color = torch.jit.load(os.path.join(path, 'color_mlp.pt')).cuda()
+
+            self.mlp_anchor_color = torch.jit.load(os.path.join(path, 'anchor_color_mlp.pt')).cuda()
+            self.mlp_anchor_noramls = torch.jit.load(os.path.join(path, 'anchor_normals_mlp.pt')).cuda()
+            self.mlp_sonata_feat_to_anchor = torch.jit.load(os.path.join(path, 'sonata_feat_to_anchor_mlp.pt')).cuda()
+
             if self.use_feat_bank:
                 self.mlp_feature_bank = torch.jit.load(os.path.join(path, 'feature_bank_mlp.pt')).cuda()
             if self.appearance_dim > 0:
@@ -804,6 +908,11 @@ class GaussianModel:
             self.mlp_opacity.load_state_dict(checkpoint['opacity_mlp'])
             self.mlp_cov.load_state_dict(checkpoint['cov_mlp'])
             self.mlp_color.load_state_dict(checkpoint['color_mlp'])
+
+            self.mlp_anchor_color.load_state_dict(checkpoint['anchor_color_mlp'])
+            self.mlp_anchor_noramls.load_state_dict(checkpoint['anchor_normals_mlp'])
+            self.mlp_sonata_feat_to_anchor.load_state_dict(checkpoint['sonata_feat_to_anchor_mlp'])
+
             if self.use_feat_bank:
                 self.mlp_feature_bank.load_state_dict(checkpoint['feature_bank_mlp'])
             if self.appearance_dim > 0:

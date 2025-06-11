@@ -44,6 +44,8 @@ from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 
+import sonata
+
 # torch.set_num_threads(32)
 lpips_fn = lpips.LPIPS(net='vgg').to('cuda')
 
@@ -97,6 +99,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+
+    sonata_model = get_sonata_model()
+    sonata_transformer = get_sonata_transformer()
+
     for iteration in range(first_iter, opt.iterations + 1):        
         # network gui not available in scaffold-gs yet
         if network_gui.conn == None:
@@ -133,7 +139,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background)
         retain_grad = (iteration < opt.update_until and iteration >= 0)
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad, 
+                            sonata_model=sonata_model, sonata_transform=sonata_transformer)
         
         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
 
@@ -451,6 +458,38 @@ def get_logger(path):
     logger.addHandler(controlshow)
 
     return logger
+
+def get_sonata_model():
+    custom_config = dict(
+    enc_patch_size=[1024 for _ in range(5)],
+    enable_flash=False,  # reduce patch size if necessary
+    )
+    model = sonata.model.load("ckpt/sonata.pth", custom_config=custom_config).cuda()
+    for param in model.parameters():
+        param.requires_grad = False
+
+    return model
+
+def get_sonata_transformer():
+    config = [
+        dict(type="CenterShift", apply_z=True),
+        dict(
+            type="GridSample",
+            grid_size=0.02,
+            hash_type="fnv",
+            mode="train",
+            return_grid_coord=True,
+            return_inverse=True,
+        ),
+        dict(type="NormalizeColor"),
+        dict(
+            type="Collect",
+            keys=("coord", "grid_coord", "color", "inverse"),
+            feat_keys=("coord", "color", "normal"),
+        ),
+    ]
+    transform = sonata.transform.Compose(config)
+    return transform
 
 if __name__ == "__main__":
     # Set up command line argument parser

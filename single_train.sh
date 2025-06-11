@@ -1,5 +1,5 @@
 scene='mipnerf360/bicycle'
-exp_name='baseline'
+exp_name='baseline_with_sonata'
 voxel_size=0.001
 update_init_factor=16
 appearance_dim=0
