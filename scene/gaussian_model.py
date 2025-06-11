@@ -131,16 +131,16 @@ class GaussianModel:
         ).cuda()
 
         self.mlp_anchor_color = nn.Sequential(
-            nn.Linear(feat_dim,feat_dim / 2),
+            nn.Linear(feat_dim, int(feat_dim / 2)),
             nn.ReLU(True),
-            nn.Linear(feat_dim / 2, 3),
+            nn.Linear(int(feat_dim / 2), 3),
             nn.Sigmoid()
         ).cuda()
 
         self.mlp_anchor_noramls = nn.Sequential(
-            nn.Linear(feat_dim,feat_dim / 2),
+            nn.Linear(feat_dim, int(feat_dim / 2)),
             nn.ReLU(True),
-            nn.Linear(feat_dim / 2, 3),
+            nn.Linear(int(feat_dim / 2), 3),
             nn.Tanh()
         ).cuda()
 

@@ -140,9 +140,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background)
         retain_grad = (iteration < opt.update_until and iteration >= 0)
         render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad, 
-                            sonata_model=sonata_model, sonata_transform=sonata_transformer)
+                            sonata_model=sonata_model, sonata_transform=sonata_transformer, logger=logger)
         
-        image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
+        image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity, point = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"], render_pkg["point"]
 
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
@@ -152,6 +152,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
 
         loss.backward()
+
+        logger.info("sonata_point_deleted: {}".format(point.shape[0]))
+        del point
+        torch.cuda.empty_cache()
         
         iter_end.record()
 
@@ -464,10 +468,11 @@ def get_sonata_model():
     enc_patch_size=[1024 for _ in range(5)],
     enable_flash=False,  # reduce patch size if necessary
     )
-    model = sonata.model.load("ckpt/sonata.pth", custom_config=custom_config).cuda()
+    logger.info("loading sonata model")
+    model = sonata.model.load("sonata/ckpt/ckpt_sonata.pth", custom_config=custom_config).cuda()
     for param in model.parameters():
         param.requires_grad = False
-
+    logger.info("sonata model loaded")
     return model
 
 def get_sonata_transformer():
@@ -532,10 +537,10 @@ if __name__ == "__main__":
 
     
 
-    try:
-        saveRuntimeCode(os.path.join(args.model_path, 'backup'))
-    except:
-        logger.info(f'save code failed~')
+    # try:
+    #     saveRuntimeCode(os.path.join(args.model_path, 'backup'))
+    # except:
+    #     logger.info(f'save code failed~')
         
     dataset = args.source_path.split('/')[-1]
     exp_name = args.model_path.split('/')[-2]

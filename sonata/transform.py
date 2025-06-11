@@ -185,13 +185,25 @@ class CenterShift(object):
 
     def __call__(self, data_dict):
         if "coord" in data_dict.keys():
-            x_min, y_min, z_min = data_dict["coord"].min(axis=0)
-            x_max, y_max, _ = data_dict["coord"].max(axis=0)
-            if self.apply_z:
-                shift = [(x_min + x_max) / 2, (y_min + y_max) / 2, z_min]
+            coord = data_dict["coord"]
+            if isinstance(coord, torch.Tensor):
+                # Handle PyTorch tensor
+                x_min, y_min, z_min = coord.min(dim=0)[0]
+                x_max, y_max, _ = coord.max(dim=0)[0]
+                if self.apply_z:
+                    shift = torch.tensor([(x_min + x_max) / 2, (y_min + y_max) / 2, z_min], device=coord.device)
+                else:
+                    shift = torch.tensor([(x_min + x_max) / 2, (y_min + y_max) / 2, 0], device=coord.device)
+                data_dict["coord"] = coord - shift
             else:
-                shift = [(x_min + x_max) / 2, (y_min + y_max) / 2, 0]
-            data_dict["coord"] -= shift
+                # Handle NumPy array
+                x_min, y_min, z_min = coord.min(axis=0)
+                x_max, y_max, _ = coord.max(axis=0)
+                if self.apply_z:
+                    shift = np.array([(x_min + x_max) / 2, (y_min + y_max) / 2, z_min])
+                else:
+                    shift = np.array([(x_min + x_max) / 2, (y_min + y_max) / 2, 0])
+                data_dict["coord"] = coord - shift
         return data_dict
 
 
@@ -833,16 +845,39 @@ class GridSample(object):
 
     def __call__(self, data_dict):
         assert "coord" in data_dict.keys()
-        scaled_coord = data_dict["coord"] / np.array(self.grid_size)
-        grid_coord = np.floor(scaled_coord).astype(int)
-        min_coord = grid_coord.min(0)
-        grid_coord -= min_coord
-        scaled_coord -= min_coord
-        min_coord = min_coord * np.array(self.grid_size)
-        key = self.hash(grid_coord)
-        idx_sort = np.argsort(key)
-        key_sort = key[idx_sort]
-        _, inverse, count = np.unique(key_sort, return_inverse=True, return_counts=True)
+        # Handle both torch tensor and numpy array inputs
+        is_tensor = isinstance(data_dict["coord"], torch.Tensor)
+
+        if is_tensor:
+            # Process torch tensor directly
+            scaled_coord = data_dict["coord"] / torch.tensor(self.grid_size, device=data_dict["coord"].device)
+            grid_coord = torch.floor(scaled_coord).long()
+            min_coord = torch.min(grid_coord, dim=0)[0]
+            grid_coord = grid_coord - min_coord
+            scaled_coord = scaled_coord - min_coord.float()
+            min_coord = min_coord * torch.tensor(self.grid_size, device=data_dict["coord"].device)
+            
+            # Convert to numpy only for hashing operation which doesn't need gradients
+            grid_coord_np = grid_coord.cpu().numpy()
+            key = self.hash(grid_coord_np)
+            
+            # Continue processing with numpy for the sorting and selecting operations
+            idx_sort = np.argsort(key)
+            key_sort = key[idx_sort]
+            _, inverse, count = np.unique(key_sort, return_inverse=True, return_counts=True)
+        else:
+            # Original numpy implementation
+            scaled_coord = data_dict["coord"] / np.array(self.grid_size)
+            grid_coord = np.floor(scaled_coord).astype(int)
+            min_coord = grid_coord.min(0)
+            grid_coord -= min_coord
+            scaled_coord -= min_coord
+            min_coord = min_coord * np.array(self.grid_size)
+            key = self.hash(grid_coord)
+            idx_sort = np.argsort(key)
+            key_sort = key[idx_sort]
+            _, inverse, count = np.unique(key_sort, return_inverse=True, return_counts=True)
+
         if self.mode == "train":  # train mode
             idx_select = (
                 np.cumsum(np.insert(count, 0, 0)[0:-1])
@@ -857,25 +892,48 @@ class GridSample(object):
                 mask = np.zeros_like(data_dict["segment"]).astype(bool)
                 mask[data_dict["sampled_index"]] = True
                 data_dict["sampled_index"] = np.where(mask[idx_unique])[0]
+            
             data_dict = index_operator(data_dict, idx_unique)
+            
             if self.return_inverse:
-                data_dict["inverse"] = np.zeros_like(inverse)
-                data_dict["inverse"][idx_sort] = inverse
+                if is_tensor:
+                    data_dict["inverse"] = torch.zeros(inverse.size, dtype=torch.long, device=data_dict["coord"].device)
+                    data_dict["inverse"][idx_sort] = torch.tensor(inverse, device=data_dict["coord"].device)
+                else:
+                    data_dict["inverse"] = np.zeros_like(inverse)
+                    data_dict["inverse"][idx_sort] = inverse
+            
             if self.return_grid_coord:
-                data_dict["grid_coord"] = grid_coord[idx_unique]
+                if is_tensor:
+                    # We already have grid_coord as tensor
+                    data_dict["grid_coord"] = grid_coord[torch.tensor(idx_unique, device=grid_coord.device)]
+                else:
+                    data_dict["grid_coord"] = grid_coord[idx_unique]
                 data_dict["index_valid_keys"].append("grid_coord")
+            
             if self.return_min_coord:
-                data_dict["min_coord"] = min_coord.reshape([1, 3])
+                if is_tensor:
+                    data_dict["min_coord"] = min_coord.reshape(1, 3)
+                else:
+                    data_dict["min_coord"] = min_coord.reshape([1, 3])
+            
             if self.return_displacement:
-                displacement = (
-                    scaled_coord - grid_coord - 0.5
-                )  # [0, 1] -> [-0.5, 0.5] displacement to center
-                if self.project_displacement:
-                    displacement = np.sum(
-                        displacement * data_dict["normal"], axis=-1, keepdims=True
-                    )
-                data_dict["displacement"] = displacement[idx_unique]
+                if is_tensor:
+                    displacement = scaled_coord - grid_coord.float() - 0.5  # [0, 1] -> [-0.5, 0.5] displacement to center
+                    if self.project_displacement:
+                        displacement = torch.sum(
+                            displacement * data_dict["normal"], dim=-1, keepdim=True
+                        )
+                    data_dict["displacement"] = displacement[torch.tensor(idx_unique, device=displacement.device)]
+                else:
+                    displacement = scaled_coord - grid_coord - 0.5  # [0, 1] -> [-0.5, 0.5] displacement to center
+                    if self.project_displacement:
+                        displacement = np.sum(
+                            displacement * data_dict["normal"], axis=-1, keepdims=True
+                        )
+                    data_dict["displacement"] = displacement[idx_unique]
                 data_dict["index_valid_keys"].append("displacement")
+            
             return data_dict
 
         elif self.mode == "test":  # test mode
@@ -885,26 +943,49 @@ class GridSample(object):
                 idx_part = idx_sort[idx_select]
                 data_part = index_operator(data_dict, idx_part, duplicate=True)
                 data_part["index"] = idx_part
+                
                 if self.return_inverse:
-                    data_part["inverse"] = np.zeros_like(inverse)
-                    data_part["inverse"][idx_sort] = inverse
+                    if is_tensor:
+                        data_part["inverse"] = torch.zeros(inverse.size, dtype=torch.long, device=data_dict["coord"].device)
+                        data_part["inverse"][idx_sort] = torch.tensor(inverse, device=data_dict["coord"].device)
+                    else:
+                        data_part["inverse"] = np.zeros_like(inverse)
+                        data_part["inverse"][idx_sort] = inverse
+                
                 if self.return_grid_coord:
-                    data_part["grid_coord"] = grid_coord[idx_part]
+                    if is_tensor:
+                        data_part["grid_coord"] = grid_coord[torch.tensor(idx_part, device=grid_coord.device)]
+                    else:
+                        data_part["grid_coord"] = grid_coord[idx_part]
                     data_dict["index_valid_keys"].append("grid_coord")
+                
                 if self.return_min_coord:
-                    data_part["min_coord"] = min_coord.reshape([1, 3])
+                    if is_tensor:
+                        data_part["min_coord"] = min_coord.reshape(1, 3)
+                    else:
+                        data_part["min_coord"] = min_coord.reshape([1, 3])
+                
                 if self.return_displacement:
-                    displacement = (
-                        scaled_coord - grid_coord - 0.5
-                    )  # [0, 1] -> [-0.5, 0.5] displacement to center
-                    if self.project_displacement:
-                        displacement = np.sum(
-                            displacement * data_dict["normal"], axis=-1, keepdims=True
-                        )
-                    data_dict["displacement"] = displacement[idx_part]
+                    if is_tensor:
+                        displacement = scaled_coord - grid_coord.float() - 0.5
+                        if self.project_displacement:
+                            displacement = torch.sum(
+                                displacement * data_dict["normal"], dim=-1, keepdim=True
+                            )
+                        data_part["displacement"] = displacement[torch.tensor(idx_part, device=displacement.device)]
+                    else:
+                        displacement = scaled_coord - grid_coord - 0.5
+                        if self.project_displacement:
+                            displacement = np.sum(
+                                displacement * data_dict["normal"], axis=-1, keepdims=True
+                            )
+                        data_part["displacement"] = displacement[idx_part]
                     data_dict["index_valid_keys"].append("displacement")
+                
                 data_part_list.append(data_part)
+            
             return data_part_list
+
         else:
             raise NotImplementedError
 

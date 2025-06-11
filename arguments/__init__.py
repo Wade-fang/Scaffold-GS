@@ -144,10 +144,10 @@ class OptimizationParams(ParamGroup):
         self.mlp_anchor_color_lr_delay_mult = 0.01
         self.mlp_anchor_color_lr_max_steps = 30_000
 
-        self.mlp_anchor_normal_lr_init = 0.01
-        self.mlp_anchor_normal_lr_final = 0.0001
-        self.mlp_anchor_normal_lr_delay_mult = 0.01
-        self.mlp_anchor_normal_lr_max_steps = 30_000
+        self.mlp_anchor_normals_lr_init = 0.01
+        self.mlp_anchor_normals_lr_final = 0.0001
+        self.mlp_anchor_normals_lr_delay_mult = 0.01
+        self.mlp_anchor_normals_lr_max_steps = 30_000
 
         self.mlp_sonata_feat_to_anchor_lr_init = 0.05
         self.mlp_sonata_feat_to_anchor_lr_final = 0.0005

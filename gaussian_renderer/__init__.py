@@ -16,8 +16,15 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 import sonata
 
+def cuda_info_show(logger=None):
+    torch.cuda.synchronize()  # 同步所有CUDA操作
+    memory_allocated = torch.cuda.memory_allocated() / 1024 / 1024  # MB
+    memory_reserved = torch.cuda.memory_reserved() / 1024 / 1024   # MB
+    memory_free = (torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_reserved()) / 1024 / 1024
+    logger.info(f"GPU Memory - Allocated: {memory_allocated:.2f}MB, Reserved: {memory_reserved:.2f}MB, Free: {memory_free:.2f}MB")
+
 def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask=None, is_training=False, 
-                              sonata_model=None, sonata_transformer=None):
+                              sonata_model=None, sonata_transformer=None, logger=None):
     ## view frustum filtering for acceleration    
     if visible_mask is None:
         visible_mask = torch.ones(pc.get_anchor.shape[0], dtype=torch.bool, device = pc.get_anchor.device)
@@ -47,20 +54,26 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
             feat[:,::1, :1]*bank_weight[:,:,2:]
         feat = feat.squeeze(dim=-1) # [n, c]
 
+    point = None
     # 在这里要加入自己的模块
     if sonata_model is not None:
         anchor_color = pc.get_anchor_color_mlp(feat)
         anchor_normals = pc.get_anchor_normals_mlp(feat)
+        logger.info("anchor_coord shape: {}".format(anchor.shape))
+        cuda_info_show(logger=logger)
         anchor_to_points = {
             "coord": anchor,  # (N, 3)
-            "color": anchor_normals,  # (N, 3)
-            "normal": anchor_color,  # (N, 3)
+            "color": anchor_color,  # (N, 3)
+            "normal": anchor_normals,  # (N, 3)
         }
         point = sonata_transformer(anchor_to_points)
+        cuda_info_show(logger=logger)
         for key in point.keys():
             if isinstance(point[key], torch.Tensor):
                 point[key] = point[key].cuda(non_blocking=True)
-        after_model_points = sonata_model(anchor_to_points)
+        cuda_info_show(logger=logger)
+        point = sonata_model(point)
+        cuda_info_show(logger=logger)
         for _ in range(2):
             assert "pooling_parent" in point.keys()
             assert "pooling_inverse" in point.keys()
@@ -74,6 +87,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
             inverse = point.pop("pooling_inverse")
             parent.feat = point.feat[inverse]
             point = parent
+        cuda_info_show(logger=logger)
         after_model_feats = point.feat[point.inverse]
         # 微调从sonata中获取的特征
         final_feat = pc.get_sonata_feat_to_anchor_mlp(after_model_feats)  # (N, c)
@@ -140,12 +154,12 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     xyz = repeat_anchor + offsets
 
     if is_training:
-        return xyz, color, opacity, scaling, rot, neural_opacity, mask
+        return xyz, color, opacity, scaling, rot, neural_opacity, mask, point
     else:
-        return xyz, color, opacity, scaling, rot
+        return xyz, color, opacity, scaling, rot, point
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False, 
-           sonata_model=None, sonata_transformer=None):
+           sonata_model=None, sonata_transform=None, logger=None):
     """
     Render the scene. 
     
@@ -154,10 +168,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     is_training = pc.get_color_mlp.training
         
     if is_training:
-        xyz, color, opacity, scaling, rot, neural_opacity, mask = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training, 
-                                                                                            sonata_model=sonata_model, sonata_transformer=sonata_transformer)
+        xyz, color, opacity, scaling, rot, neural_opacity, mask, point = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training, 
+                                                                                            sonata_model=sonata_model, sonata_transformer=sonata_transform, logger=logger)
     else:
-        xyz, color, opacity, scaling, rot = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
+        xyz, color, opacity, scaling, rot, point = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training,
+                                                                      sonata_model=sonata_model, sonata_transformer=sonata_transform, logger=logger)
     
 
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
@@ -210,12 +225,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 "selection_mask": mask,
                 "neural_opacity": neural_opacity,
                 "scaling": scaling,
+                "point": point,
                 }
     else:
         return {"render": rendered_image,
                 "viewspace_points": screenspace_points,
                 "visibility_filter" : radii > 0,
                 "radii": radii,
+                "point": point,
                 }
 
 
