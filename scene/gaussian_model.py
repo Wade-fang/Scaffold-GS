@@ -20,8 +20,10 @@ from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
-from utils.general_utils import strip_symmetric, build_scaling_rotation
+from utils.general_utils import strip_symmetric, build_scaling_rotation, get_free_gpu
 from scene.embedding import Embedding
+import open3d as o3d
+from pointNN import Point_NN
 
     
 class GaussianModel:
@@ -57,6 +59,12 @@ class GaussianModel:
                  add_opacity_dist : bool = False,
                  add_cov_dist : bool = False,
                  add_color_dist : bool = False,
+                 pointNN_feat_dim: int = 1152,
+                 salient_radius: float = 0.1,
+                 non_max_radius: float = 0.05,
+                 gamma_21: float = 0.975,
+                 gamma_32: float = 0.975,
+                 min_neighbors: int = 5
                  ):
 
         self.feat_dim = feat_dim
@@ -77,6 +85,15 @@ class GaussianModel:
         self._anchor = torch.empty(0)
         self._offset = torch.empty(0)
         self._anchor_feat = torch.empty(0)
+
+        # 增设一个从pointNN中计算出来的全局特征
+        self._pointNN_feat = torch.empty(0)
+        self.pointNN_feat_dim = pointNN_feat_dim
+        self.salient_radius = salient_radius
+        self.non_max_radius = non_max_radius
+        self.gamma_21 = gamma_21
+        self.gamma_32 = gamma_32
+        self.min_neighbors = min_neighbors
         
         self.opacity_accum = torch.empty(0)
 
@@ -127,11 +144,21 @@ class GaussianModel:
             nn.Sigmoid()
         ).cuda()
 
+        # 增设一个负责调整pointNN中计算出来的全局特征的MLP
+        self.mlp_global_feat = nn.Sequential(
+            nn.Linear(self.pointNN_feat_dim, 512),
+            nn.ReLU(True),
+            nn.Linear(512, 128),
+            nn.ReLU(True),
+            nn.Linear(128, self.feat_dim)
+        ).cuda()
+
 
     def eval(self):
         self.mlp_opacity.eval()
         self.mlp_cov.eval()
         self.mlp_color.eval()
+        self.mlp_global_feat.eval()
         if self.appearance_dim > 0:
             self.embedding_appearance.eval()
         if self.use_feat_bank:
@@ -141,6 +168,7 @@ class GaussianModel:
         self.mlp_opacity.train()
         self.mlp_cov.train()
         self.mlp_color.train()
+        self.mlp_global_feat.train()
         if self.appearance_dim > 0:
             self.embedding_appearance.train()
         if self.use_feat_bank:                   
@@ -231,6 +259,56 @@ class GaussianModel:
         data = np.unique(np.round(data/voxel_size), axis=0)*voxel_size
         
         return data
+    
+    def get_after_iss_anchors(self):
+        points_tensor = self.get_anchor 
+        # 将tensor转换为numpy数组，然后创建Open3D点云对象
+        if hasattr(points_tensor, 'cpu'):  # PyTorch tensor
+            points_array = points_tensor.cpu().detach().numpy()
+        elif hasattr(points_tensor, 'numpy'):  # TensorFlow tensor
+            points_array = points_tensor.numpy()
+        else:  # 已经是numpy数组
+            points_array = points_tensor
+        
+        # 创建Open3D点云对象
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points_array)
+
+        # 3. 计算法向量（ISS算法需要）
+        pcd.estimate_normals(
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30)
+        )
+
+        # 4. 配置ISS参数
+        iss_keypoints = o3d.geometry.keypoint.compute_iss_keypoints(
+            pcd,
+            salient_radius=self.salient_radius,      # 显著性半径
+            non_max_radius=self.non_max_radius,     # 非最大值抑制半径
+            gamma_21=self.gamma_21,          # 第二和第一特征值比值阈值
+            gamma_32=self.gamma_32,          # 第三和第二特征值比值阈值
+            min_neighbors=self.min_neighbors         # 最小邻居数
+        )
+        keypoints_array = torch.tensor(iss_keypoints.points)
+        return keypoints_array
+
+    def cauculate_and_set_pointNN_feat(self):
+        downsampled_points = self.get_after_iss_anchors()
+        if downsampled_points.shape[0] == 0:
+            print("No points after ISS, skipping PointNN feature calculation.")
+        # 获取当前点云的点数
+        points_num = downsampled_points.shape[0]
+        device = get_free_gpu()
+        # 调整一下输入格式
+        downsampled_points = downsampled_points.to(device).unsqueeze(dim=0).permute(0, 2, 1)
+        # 创建模型实例
+        point_nn = Point_NN(input_points=points_num, num_stages=4,
+                    embed_dim=72, k_neighbors=90,
+                    alpha=1000, beta=100).to(device)
+        point_nn.eval()
+        # 计算点云的特征
+        point_features = point_nn(downsampled_points)
+        self._pointNN_feat = point_features.to(self.get_anchor.device)
+
 
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
         self.spatial_lr_scale = spatial_lr_scale
@@ -270,6 +348,9 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(False))
         self._opacity = nn.Parameter(opacities.requires_grad_(False))
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
+
+        print("calculate pointNN feature:")
+        self.cauculate_and_set_pointNN_feat()
 
 
     def training_setup(self, training_args):
@@ -678,7 +759,7 @@ class GaussianModel:
                 
 
 
-    def adjust_anchor(self, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005):
+    def adjust_anchor(self, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005, logger=None):
         # # adding anchors
         grads = self.offset_gradient_accum / self.offset_denom # [N*k, 1]
         grads[grads.isnan()] = 0.0
@@ -703,6 +784,7 @@ class GaussianModel:
         # # prune anchors
         prune_mask = (self.opacity_accum < min_opacity*self.anchor_demon).squeeze(dim=1)
         anchors_mask = (self.anchor_demon > check_interval*success_threshold).squeeze(dim=1) # [N, 1]
+        # anchor访问的多的，但是opacity又小的，不保留
         prune_mask = torch.logical_and(prune_mask, anchors_mask) # [N] 
         
         # update offset_denom

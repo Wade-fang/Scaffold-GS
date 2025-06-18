@@ -147,6 +147,8 @@ class OptimizationParams(ParamGroup):
         self.update_from = 1500
         self.update_interval = 100
         self.update_until = 15_000
+
+        self.start_cal_global_feat = 250
         
         self.min_opacity = 0.005
         self.success_threshold = 0.8

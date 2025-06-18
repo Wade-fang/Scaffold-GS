@@ -131,3 +131,27 @@ def safe_state(silent):
     np.random.seed(0)
     torch.manual_seed(0)
     torch.cuda.set_device(torch.device("cuda:0"))
+
+def get_free_gpu():
+    """
+    获取显存使用最少的GPU设备
+    """
+    if not torch.cuda.is_available():
+        return torch.device('cpu')
+    
+    num_gpus = torch.cuda.device_count()
+    if num_gpus == 1:
+        return torch.device('cuda:0')
+    
+    # 检查每个GPU的显存使用情况
+    min_memory_used = float('inf')
+    best_gpu = 0
+    
+    for i in range(num_gpus):
+        torch.cuda.set_device(i)
+        memory_used = torch.cuda.memory_allocated(i)
+        if memory_used < min_memory_used:
+            min_memory_used = memory_used
+            best_gpu = i
+    
+    return torch.device(f'cuda:{best_gpu}')

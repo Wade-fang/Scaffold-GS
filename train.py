@@ -97,6 +97,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+
+    max_visible_anchor_num = 0
+    max_busy_anchor_num = 0
     for iteration in range(first_iter, opt.iterations + 1):        
         # network gui not available in scaffold-gs yet
         if network_gui.conn == None:
@@ -125,7 +128,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         # Pick a random Camera
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+        cur_camrea_index = randint(0, len(viewpoint_stack)-1)
+        viewpoint_cam = viewpoint_stack.pop(cur_camrea_index)
 
         # Render
         if (iteration - 1) == debug_from:
@@ -133,6 +137,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background)
         retain_grad = (iteration < opt.update_until and iteration >= 0)
+
         render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad)
         
         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
@@ -171,7 +176,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 
                 # densification
                 if iteration > opt.update_from and iteration % opt.update_interval == 0:
-                    gaussians.adjust_anchor(check_interval=opt.update_interval, success_threshold=opt.success_threshold, grad_threshold=opt.densify_grad_threshold, min_opacity=opt.min_opacity)
+                    gaussians.adjust_anchor(check_interval=opt.update_interval, success_threshold=opt.success_threshold, grad_threshold=opt.densify_grad_threshold, min_opacity=opt.min_opacity, logger=logger)
             elif iteration == opt.update_until:
                 del gaussians.opacity_accum
                 del gaussians.offset_gradient_accum
