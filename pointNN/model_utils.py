@@ -34,7 +34,12 @@ def index_points(points, idx):
         new_points:, indexed points data, [B, S, C]
     """
     device = points.device
-    B = points.shape[0]
+    B, N, C = points.shape
+    
+    # Clamp indices to valid range to prevent illegal memory access
+    idx = torch.clamp(idx, 0, N - 1)
+
+    
     view_shape = list(idx.shape)
     view_shape[1:] = [1] * (len(view_shape) - 1)
     repeat_shape = list(idx.shape)
@@ -52,6 +57,42 @@ def knn_point(nsample, xyz, new_xyz):
     Return:
         group_idx: grouped points index, [B, S, nsample]
     """
-    sqrdists = square_distance(new_xyz, xyz)
-    _, group_idx = torch.topk(sqrdists, nsample, dim=-1, largest=False, sorted=False)
+    B, S, C = new_xyz.shape
+    _, N, _ = xyz.shape
+    
+    # Calculate batch size based on available memory
+    # Process in chunks to avoid OOM with large matrices like 22255 * 44510
+    chunk_size = min(1000, S)  # Process 1000 query points at a time
+    
+    group_idx_list = []
+    
+    for i in range(0, S, chunk_size):
+        end_idx = min(i + chunk_size, S)
+        chunk_new_xyz = new_xyz[:, i:end_idx, :]
+        
+        try:
+            sqrdists = square_distance(chunk_new_xyz, xyz)
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                print(f"CUDA out of memory error: {e}")
+                raise e
+            else:
+                raise e
+        
+        # Clamp to avoid NaN/inf values that could cause illegal memory access
+        sqrdists = torch.clamp(sqrdists, min=0.0, max=1e6)
+        
+        if not sqrdists.is_contiguous():
+            sqrdists = sqrdists.contiguous()
+        
+        _, chunk_group_idx = torch.topk(sqrdists, nsample, dim=-1, largest=False, sorted=False)
+        group_idx_list.append(chunk_group_idx)
+        
+        # Clear intermediate results to free memory
+        del sqrdists
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    
+    # Concatenate all chunks
+    group_idx = torch.cat(group_idx_list, dim=1)
+    
     return group_idx

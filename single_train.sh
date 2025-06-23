@@ -1,4 +1,6 @@
-scene='mipnerf360/bicycle'
+export CUDA_VISIBLE_DEVICES=0,1
+
+scene='mipnerf360/garden'
 exp_name='baseline'
 voxel_size=0.001
 update_init_factor=16

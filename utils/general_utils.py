@@ -148,9 +148,8 @@ def get_free_gpu():
     best_gpu = 0
     
     for i in range(num_gpus):
-        torch.cuda.set_device(i)
         memory_used = torch.cuda.memory_allocated(i)
-        if memory_used < min_memory_used:
+        if memory_used <= min_memory_used:
             min_memory_used = memory_used
             best_gpu = i
     

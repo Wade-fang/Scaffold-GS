@@ -261,14 +261,15 @@ class GaussianModel:
         return data
     
     def get_after_iss_anchors(self):
-        points_tensor = self.get_anchor 
+        points_tensor = self.get_anchor
+        print("total anchor shape:", points_tensor.shape)
         # 将tensor转换为numpy数组，然后创建Open3D点云对象
         if hasattr(points_tensor, 'cpu'):  # PyTorch tensor
             points_array = points_tensor.cpu().detach().numpy()
         elif hasattr(points_tensor, 'numpy'):  # TensorFlow tensor
             points_array = points_tensor.numpy()
         else:  # 已经是numpy数组
-            points_array = points_tensor
+            points_array = points_tensor        
         
         # 创建Open3D点云对象
         pcd = o3d.geometry.PointCloud()
@@ -282,13 +283,14 @@ class GaussianModel:
         # 4. 配置ISS参数
         iss_keypoints = o3d.geometry.keypoint.compute_iss_keypoints(
             pcd,
-            salient_radius=self.salient_radius,      # 显著性半径
-            non_max_radius=self.non_max_radius,     # 非最大值抑制半径
+            salient_radius=self.salient_radius * 0.8,      # 显著性半径
+            non_max_radius=self.non_max_radius * 0.5,     # 非最大值抑制半径
             gamma_21=self.gamma_21,          # 第二和第一特征值比值阈值
             gamma_32=self.gamma_32,          # 第三和第二特征值比值阈值
             min_neighbors=self.min_neighbors         # 最小邻居数
         )
-        keypoints_array = torch.tensor(iss_keypoints.points)
+        keypoints_numpy = np.array(iss_keypoints.points, dtype=np.float32)
+        keypoints_array = torch.from_numpy(keypoints_numpy).requires_grad_(False)
         return keypoints_array
 
     def cauculate_and_set_pointNN_feat(self):
@@ -297,17 +299,29 @@ class GaussianModel:
             print("No points after ISS, skipping PointNN feature calculation.")
         # 获取当前点云的点数
         points_num = downsampled_points.shape[0]
+        print("Number of points after ISS: ", points_num)
+
+        anchors = self.get_anchor
+        cur_anchor_num = anchors.shape[0]
+
         device = get_free_gpu()
+        torch.cuda.set_device(device)
         # 调整一下输入格式
-        downsampled_points = downsampled_points.to(device).unsqueeze(dim=0).permute(0, 2, 1)
+        downsampled_points_cuda = downsampled_points.cuda().unsqueeze(dim=0).permute(0, 2, 1)
         # 创建模型实例
         point_nn = Point_NN(input_points=points_num, num_stages=4,
-                    embed_dim=72, k_neighbors=90,
-                    alpha=1000, beta=100).to(device)
-        point_nn.eval()
+                    embed_dim=72, k_neighbors=16,
+                    alpha=1000, beta=100).cuda()
         # 计算点云的特征
-        point_features = point_nn(downsampled_points)
-        self._pointNN_feat = point_features.to(self.get_anchor.device)
+        point_features = point_nn(downsampled_points_cuda)
+        point_features_clone = point_features.clone()
+        point_features_temp = point_features_clone.cpu()
+        self._pointNN_feat = point_features_temp.clone()
+        print("sucessfully set pointNN_feat")
+        
+
+        torch.cuda.set_device(torch.device("cuda:0"))
+ 
 
 
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
@@ -351,6 +365,7 @@ class GaussianModel:
 
         print("calculate pointNN feature:")
         self.cauculate_and_set_pointNN_feat()
+        print("pointNN feature calculated. shape: ", self._pointNN_feat.shape)
 
 
     def training_setup(self, training_args):

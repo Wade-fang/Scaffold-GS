@@ -18,11 +18,10 @@ class FPS_kNN(nn.Module):
         B, N, _ = xyz.shape
 
         # FPS
-        fps_idx = pointnet2_utils.furthest_point_sample(xyz, self.group_num).long() 
+        fps_idx = pointnet2_utils.furthest_point_sample(xyz, self.group_num).long()
         lc_xyz = index_points(xyz, fps_idx)
         lc_x = index_points(x, fps_idx)
 
-        # kNN
         knn_idx = knn_point(self.k_neighbors, xyz, lc_xyz)
         knn_xyz = index_points(xyz, knn_idx)
         knn_x = index_points(x, knn_idx)
@@ -87,7 +86,7 @@ class PosE_Initial(nn.Module):
         B, _, N = xyz.shape    
         feat_dim = self.out_dim // (self.in_dim * 2)
         
-        feat_range = torch.arange(feat_dim).float().to(xyz.device)
+        feat_range = torch.arange(feat_dim).float().cuda()
         dim_embed = torch.pow(self.alpha, feat_range / feat_dim)
         div_embed = torch.div(self.beta * xyz.unsqueeze(-1), dim_embed)
 
@@ -111,7 +110,7 @@ class PosE_Geo(nn.Module):
         B, _, G, K = knn_xyz.shape
         feat_dim = self.out_dim // (self.in_dim * 2)
 
-        feat_range = torch.arange(feat_dim).float().to(knn_xyz.device)   
+        feat_range = torch.arange(feat_dim).float().cuda()   
         dim_embed = torch.pow(self.alpha, feat_range / feat_dim)
         div_embed = torch.div(self.beta * knn_xyz.unsqueeze(-1), dim_embed)
 
@@ -186,7 +185,6 @@ class Point_NN(nn.Module):
         # xyz: point coordinates
         # x: point features
         xyz = x.permute(0, 2, 1)
-        print(f"xyz is on device: {xyz.device}")
 
 
         # Non-Parametric Encoder

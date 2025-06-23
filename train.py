@@ -15,7 +15,10 @@ import numpy as np
 import subprocess
 cmd = 'nvidia-smi -q -d Memory |grep -A4 GPU|grep Used'
 result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).stdout.decode().split('\n')
-os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in result[:-1]]))
+gpu_memory_usage = [int(x.split()[2]) for x in result[:-1]]
+# 获取内存使用量最少的两个GPU的索引
+two_least_used_gpus = np.argsort(gpu_memory_usage)[:2]
+os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, two_least_used_gpus))
 
 os.system('echo $CUDA_VISIBLE_DEVICES')
 
@@ -177,6 +180,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 # densification
                 if iteration > opt.update_from and iteration % opt.update_interval == 0:
                     gaussians.adjust_anchor(check_interval=opt.update_interval, success_threshold=opt.success_threshold, grad_threshold=opt.densify_grad_threshold, min_opacity=opt.min_opacity, logger=logger)
+                    gaussians.cauculate_and_set_pointNN_feat()
             elif iteration == opt.update_until:
                 del gaussians.opacity_accum
                 del gaussians.offset_gradient_accum
@@ -498,10 +502,10 @@ if __name__ == "__main__":
 
     
 
-    try:
-        saveRuntimeCode(os.path.join(args.model_path, 'backup'))
-    except:
-        logger.info(f'save code failed~')
+    # try:
+    #     saveRuntimeCode(os.path.join(args.model_path, 'backup'))
+    # except:
+    #     logger.info(f'save code failed~')
         
     dataset = args.source_path.split('/')[-1]
     exp_name = args.model_path.split('/')[-2]
