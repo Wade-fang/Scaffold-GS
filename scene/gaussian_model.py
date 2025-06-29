@@ -64,7 +64,9 @@ class GaussianModel:
                  non_max_radius: float = 0.05,
                  gamma_21: float = 0.975,
                  gamma_32: float = 0.975,
-                 min_neighbors: int = 5
+                 min_neighbors: int = 5,
+                 num_stages: int = 4,
+                 embed_dim: int = 16,
                  ):
 
         self.feat_dim = feat_dim
@@ -87,6 +89,7 @@ class GaussianModel:
         self._anchor_feat = torch.empty(0)
 
         # 增设一个从pointNN中计算出来的全局特征
+        self.add_global_feat = False
         self._pointNN_feat = torch.empty(0)
         self.pointNN_feat_dim = pointNN_feat_dim
         self.salient_radius = salient_radius
@@ -105,6 +108,9 @@ class GaussianModel:
         self.offset_gradient_accum = torch.empty(0)
         self.offset_denom = torch.empty(0)
 
+        self.offset_splitting_mats_accum = torch.empty(0)
+        self.S_estimator = "approx"
+
         self.anchor_demon = torch.empty(0)
                 
         self.optimizer = None
@@ -120,29 +126,60 @@ class GaussianModel:
                 nn.Softmax(dim=1)
             ).cuda()
 
+        mlp_feat_dim = embed_dim * (2 ** num_stages)
+
         self.opacity_dist_dim = 1 if self.add_opacity_dist else 0
-        self.mlp_opacity = nn.Sequential(
-            nn.Linear(feat_dim+3+self.opacity_dist_dim, feat_dim),
-            nn.ReLU(True),
-            nn.Linear(feat_dim, n_offsets),
-            nn.Tanh()
-        ).cuda()
+        if self.add_global_feat:
+            self.mlp_opacity = nn.Sequential(
+                nn.Linear(mlp_feat_dim+feat_dim+3+self.opacity_dist_dim, mlp_feat_dim),
+                nn.ReLU(True),
+                nn.Linear(mlp_feat_dim, feat_dim),
+                nn.ReLU(True),
+                nn.Linear(feat_dim, n_offsets),
+                nn.Tanh()
+            ).cuda()
+        else:
+            self.mlp_opacity = nn.Sequential(
+                nn.Linear(feat_dim+3+self.opacity_dist_dim, feat_dim),
+                nn.ReLU(True),
+                nn.Linear(feat_dim, n_offsets),
+                nn.Tanh()
+            ).cuda()
 
         self.add_cov_dist = add_cov_dist
         self.cov_dist_dim = 1 if self.add_cov_dist else 0
-        self.mlp_cov = nn.Sequential(
-            nn.Linear(feat_dim+3+self.cov_dist_dim, feat_dim),
-            nn.ReLU(True),
-            nn.Linear(feat_dim, 7*self.n_offsets),
-        ).cuda()
+        if self.add_global_feat:
+            self.mlp_cov = nn.Sequential(
+                nn.Linear(mlp_feat_dim+feat_dim+3+self.cov_dist_dim, mlp_feat_dim),
+                nn.ReLU(True),
+                nn.Linear(mlp_feat_dim, feat_dim),
+                nn.ReLU(True),
+                nn.Linear(feat_dim, 7*self.n_offsets)
+            ).cuda()
+        else:
+            self.mlp_cov = nn.Sequential(
+                nn.Linear(feat_dim+3+self.cov_dist_dim, feat_dim),
+                nn.ReLU(True),
+                nn.Linear(feat_dim, 7*self.n_offsets),
+            ).cuda()
 
         self.color_dist_dim = 1 if self.add_color_dist else 0
-        self.mlp_color = nn.Sequential(
-            nn.Linear(feat_dim+3+self.color_dist_dim+self.appearance_dim, feat_dim),
-            nn.ReLU(True),
-            nn.Linear(feat_dim, 3*self.n_offsets),
-            nn.Sigmoid()
-        ).cuda()
+        if self.add_global_feat:
+            self.mlp_color = nn.Sequential(
+                nn.Linear(mlp_feat_dim+feat_dim+3+self.color_dist_dim+self.appearance_dim, mlp_feat_dim),
+                nn.ReLU(True),
+                nn.Linear(mlp_feat_dim, feat_dim),
+                nn.ReLU(True),
+                nn.Linear(feat_dim, 3*self.n_offsets),
+                nn.Sigmoid()
+            ).cuda()
+        else:
+            self.mlp_color = nn.Sequential(
+                nn.Linear(feat_dim+3+self.color_dist_dim+self.appearance_dim, feat_dim),
+                nn.ReLU(True),
+                nn.Linear(feat_dim, 3*self.n_offsets),
+                nn.Sigmoid()
+            ).cuda()
 
         # 增设一个负责调整pointNN中计算出来的全局特征的MLP
         self.mlp_global_feat = nn.Sequential(
@@ -262,7 +299,6 @@ class GaussianModel:
     
     def get_after_iss_anchors(self):
         points_tensor = self.get_anchor
-        print("total anchor shape:", points_tensor.shape)
         # 将tensor转换为numpy数组，然后创建Open3D点云对象
         if hasattr(points_tensor, 'cpu'):  # PyTorch tensor
             points_array = points_tensor.cpu().detach().numpy()
@@ -283,8 +319,8 @@ class GaussianModel:
         # 4. 配置ISS参数
         iss_keypoints = o3d.geometry.keypoint.compute_iss_keypoints(
             pcd,
-            salient_radius=self.salient_radius * 0.8,      # 显著性半径
-            non_max_radius=self.non_max_radius * 0.5,     # 非最大值抑制半径
+            salient_radius=self.salient_radius,      # 显著性半径
+            non_max_radius=self.non_max_radius,     # 非最大值抑制半径
             gamma_21=self.gamma_21,          # 第二和第一特征值比值阈值
             gamma_32=self.gamma_32,          # 第三和第二特征值比值阈值
             min_neighbors=self.min_neighbors         # 最小邻居数
@@ -293,37 +329,29 @@ class GaussianModel:
         keypoints_array = torch.from_numpy(keypoints_numpy).requires_grad_(False)
         return keypoints_array
 
-    def cauculate_and_set_pointNN_feat(self):
-        downsampled_points = self.get_after_iss_anchors()
-        if downsampled_points.shape[0] == 0:
-            print("No points after ISS, skipping PointNN feature calculation.")
+    def cauculate_and_set_pointNN_feat(self, c_points=None, opt = None):
         # 获取当前点云的点数
-        points_num = downsampled_points.shape[0]
-        print("Number of points after ISS: ", points_num)
-
-        anchors = self.get_anchor
-        cur_anchor_num = anchors.shape[0]
+        points_num = c_points.shape[0]
+        print("c_points shape: ", c_points.shape)
 
         device = get_free_gpu()
         torch.cuda.set_device(device)
         # 调整一下输入格式
-        downsampled_points_cuda = downsampled_points.cuda().unsqueeze(dim=0).permute(0, 2, 1)
+        downsampled_points_cuda = c_points.cuda().unsqueeze(dim=0).permute(0, 2, 1)
+        print("downsampled_points_cuda shape: ", downsampled_points_cuda.shape)
         # 创建模型实例
-        point_nn = Point_NN(input_points=points_num, num_stages=4,
-                    embed_dim=72, k_neighbors=16,
-                    alpha=1000, beta=100).cuda()
+        point_nn = Point_NN(input_points=points_num, num_stages=opt.num_stages,
+                    embed_dim=opt.embed_dim, k_neighbors=opt.k_neighbors,
+                    alpha=opt.alpha, beta=opt.beta).cuda()
         # 计算点云的特征
         point_features = point_nn(downsampled_points_cuda)
-        point_features_clone = point_features.clone()
-        point_features_temp = point_features_clone.cpu()
-        self._pointNN_feat = point_features_temp.clone()
-        print("sucessfully set pointNN_feat")
-        
 
         torch.cuda.set_device(torch.device("cuda:0"))
- 
-
-
+       
+        self._pointNN_feat = point_features.detach().cuda()
+        
+        print("sucessfully set pointNN_feat")
+        
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
         self.spatial_lr_scale = spatial_lr_scale
         points = pcd.points[::self.ratio]
@@ -363,12 +391,12 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(False))
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
 
-        print("calculate pointNN feature:")
-        self.cauculate_and_set_pointNN_feat()
-        print("pointNN feature calculated. shape: ", self._pointNN_feat.shape)
 
 
     def training_setup(self, training_args):
+        self.cauculate_and_set_pointNN_feat(c_points=self.get_anchor, opt=training_args)
+        self._pointNN_feat = nn.Parameter(self._pointNN_feat.requires_grad_(False))
+
         self.percent_dense = training_args.percent_dense
 
         self.opacity_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
@@ -376,6 +404,8 @@ class GaussianModel:
         self.offset_gradient_accum = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.offset_denom = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.anchor_demon = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
+
+        self.xyz_splitting_mat_accum = torch.zeros((self.get_anchor.shape[0], 3, 3), device="cuda")
 
         
         
@@ -407,6 +437,20 @@ class GaussianModel:
                 {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
                 {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
                 {'params': self.embedding_appearance.parameters(), 'lr': training_args.appearance_lr_init, "name": "embedding_appearance"},
+            ]
+        elif self.add_global_feat :
+            l = [
+                {'params': [self._anchor], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "anchor"},
+                {'params': [self._offset], 'lr': training_args.offset_lr_init * self.spatial_lr_scale, "name": "offset"},
+                {'params': [self._anchor_feat], 'lr': training_args.feature_lr, "name": "anchor_feat"},
+                {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
+                {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
+                {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
+
+                {'params': self.mlp_opacity.parameters(), 'lr': training_args.mlp_opacity_lr_init, "name": "mlp_opacity"},
+                {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
+                {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
+                {'params': self.mlp_global_feat.parameters(), 'lr': training_args.mlp_global_feat_lr_init, "name": "mlp_global_feat"},
             ]
         else:
             l = [
@@ -456,6 +500,11 @@ class GaussianModel:
                                                         lr_final=training_args.appearance_lr_final,
                                                         lr_delay_mult=training_args.appearance_lr_delay_mult,
                                                         max_steps=training_args.appearance_lr_max_steps)
+        if self.add_global_feat:
+            self.mlp_global_feat_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_global_feat_lr_init,
+                                                        lr_final=training_args.mlp_global_feat_lr_final,
+                                                        lr_delay_mult=training_args.mlp_global_feat_lr_delay_mult,
+                                                        max_steps=training_args.mlp_global_feat_lr_max_steps)
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
@@ -480,6 +529,9 @@ class GaussianModel:
                 param_group['lr'] = lr
             if self.appearance_dim > 0 and param_group["name"] == "embedding_appearance":
                 lr = self.appearance_scheduler_args(iteration)
+                param_group['lr'] = lr
+            if self.add_global_feat and param_group["name"] == "mlp_global_feat":
+                lr = self.mlp_global_feat_scheduler_args(iteration)
                 param_group['lr'] = lr
             
             
@@ -602,7 +654,7 @@ class GaussianModel:
 
 
     # statis grad information to guide liftting. 
-    def training_statis(self, viewspace_point_tensor, opacity, update_filter, offset_selection_mask, anchor_visible_mask):
+    def training_statis(self, viewspace_point_tensor, opacity, update_filter, offset_selection_mask, anchor_visible_mask, splitting_mats):
         # update opacity stats
         temp_opacity = opacity.clone().view(-1).detach()
         temp_opacity[temp_opacity<0] = 0
@@ -620,9 +672,15 @@ class GaussianModel:
         temp_mask = combined_mask.clone()
         combined_mask[temp_mask] = update_filter
         
+        print("viewspace_point_tensor grad shape: ", viewspace_point_tensor.grad.shape)
+        print("splitting_mats grad shape: ", splitting_mats.grad.shape)
         grad_norm = torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.offset_gradient_accum[combined_mask] += grad_norm
         self.offset_denom[combined_mask] += 1
+
+
+        self.offset_splitting_mats_accum[combined_mask] += splitting_mats.grad[update_filter]
+        print("successfully update offset_splitting_mats_accum")
 
         
 
@@ -781,7 +839,11 @@ class GaussianModel:
         grads_norm = torch.norm(grads, dim=-1)
         offset_mask = (self.offset_denom > check_interval*success_threshold*0.5).squeeze(dim=1)
         
+        print(f"Number of anchors before growing: {self.get_anchor.shape[0]}")
+
         self.anchor_growing(grads_norm, grad_threshold, offset_mask)
+
+        print(f"Number of anchors after growing: {self.get_anchor.shape[0]}")
         
         # update offset_denom
         self.offset_denom[offset_mask] = 0
@@ -828,8 +890,11 @@ class GaussianModel:
 
         if prune_mask.shape[0]>0:
             self.prune_anchor(prune_mask)
+        print(f"Number of anchors after pruning: {self.get_anchor.shape[0]}")
         
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
+
+        return ~prune_mask
 
     def save_mlp_checkpoints(self, path, mode = 'split'):#split or unite
         mkdir_p(os.path.dirname(path))

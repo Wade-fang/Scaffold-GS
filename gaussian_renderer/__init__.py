@@ -15,6 +15,12 @@ import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 
+SPLITTING_ESTIMATORS = {
+    'partial': 0,
+    'approx': 1,
+    'inv_cov': 2
+}
+
 def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask=None, is_training=False,calculate_global_feat=False):
     ## view frustum filtering for acceleration    
     if visible_mask is None:
@@ -32,6 +38,8 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     # view
     ob_view = ob_view / ob_dist
 
+    pointNN_feat = pc._pointNN_feat.cuda()
+
     ## view-adaptive feature
     if pc.use_feat_bank:
         cat_view = torch.cat([ob_view, ob_dist], dim=1)
@@ -45,13 +53,10 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
             feat[:,::1, :1]*bank_weight[:,:,2:]
         feat = feat.squeeze(dim=-1) # [n, c]
 
-    if calculate_global_feat:
-        # 首先对整体anchor集进行一个下采样
-
-        # 然后把下采样后的anchor集放入point NN中计算一下全局特征
-
-        # 把point NN的输出作为MLP的输入，经过MLP处理后得到自己的MLP
-        raise NotImplementedError("Global feature calculation is not implemented in this function.")
+    # 将全局特征与局部特征进行拼接
+    if pc.add_global_feat:
+        global_feat = pointNN_feat.repeat([anchor.shape[0], 1])
+        feat = torch.cat([feat, global_feat], dim=1) # [N, c+256]
 
     cat_local_view = torch.cat([feat, ob_view, ob_dist], dim=1) # [N, c+3+1]
     cat_local_view_wodist = torch.cat([feat, ob_view], dim=1) # [N, c+3]
@@ -139,10 +144,32 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         except:
             pass
 
+    # Create zero tensor. We will use it to make pytorch return splitting matrices during back-propagating gradients
+    splitting_mats = torch.zeros((xyz.shape[0], 3, 3), dtype=xyz.dtype, requires_grad=True, device="cuda")
+    try:
+        splitting_mats.retain_grad()
+    except:
+        pass
+
 
     # Set up rasterization configuration
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+
+    # raster_settings = GaussianRasterizationSettings(
+    #     image_height=int(viewpoint_camera.image_height),
+    #     image_width=int(viewpoint_camera.image_width),
+    #     tanfovx=tanfovx,
+    #     tanfovy=tanfovy,
+    #     bg=bg_color,
+    #     scale_modifier=scaling_modifier,
+    #     viewmatrix=viewpoint_camera.world_view_transform,
+    #     projmatrix=viewpoint_camera.full_proj_transform,
+    #     sh_degree=1,
+    #     campos=viewpoint_camera.camera_center,
+    #     prefiltered=False,
+    #     debug=pipe.debug
+    # )
 
     raster_settings = GaussianRasterizationSettings(
         image_height=int(viewpoint_camera.image_height),
@@ -156,7 +183,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         sh_degree=1,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
-        debug=pipe.debug
+        debug=pipe.debug,
+        S_estimator=SPLITTING_ESTIMATORS[pc.S_estimator]
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
@@ -170,7 +198,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         opacities = opacity,
         scales = scaling,
         rotations = rot,
-        cov3D_precomp = None)
+        cov3D_precomp = None,
+        splitting_mats=splitting_mats,)
     
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     if is_training:
@@ -181,12 +210,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 "selection_mask": mask,
                 "neural_opacity": neural_opacity,
                 "scaling": scaling,
+                "splitting_mats": splitting_mats,
                 }
     else:
         return {"render": rendered_image,
                 "viewspace_points": screenspace_points,
                 "visibility_filter" : radii > 0,
                 "radii": radii,
+                "splitting_mats": splitting_mats,
                 }
 
 
@@ -219,7 +250,8 @@ def prefilter_voxel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch
         sh_degree=1,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
-        debug=pipe.debug
+        debug=pipe.debug,
+        S_estimator=SPLITTING_ESTIMATORS[pc.S_estimator]
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)

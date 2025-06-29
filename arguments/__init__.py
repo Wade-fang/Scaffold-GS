@@ -124,10 +124,10 @@ class OptimizationParams(ParamGroup):
         self.mlp_color_lr_delay_mult = 0.01
         self.mlp_color_lr_max_steps = 30_000
 
-        self.mlp_color_lr_init = 0.008
-        self.mlp_color_lr_final = 0.00005
-        self.mlp_color_lr_delay_mult = 0.01
-        self.mlp_color_lr_max_steps = 30_000
+        self.mlp_global_feat_lr_init = 0.008
+        self.mlp_global_feat_lr_final = 0.00005
+        self.mlp_global_feat_lr_delay_mult = 0.01
+        self.mlp_global_feat_lr_max_steps = 30_000
         
         self.mlp_featurebank_lr_init = 0.01
         self.mlp_featurebank_lr_final = 0.00001
@@ -149,6 +149,12 @@ class OptimizationParams(ParamGroup):
         self.update_until = 15_000
 
         self.start_cal_global_feat = 250
+
+        self.num_stages = 4
+        self.embed_dim = 12
+        self.k_neighbors = 30
+        self.alpha = 1000
+        self.beta = 100
         
         self.min_opacity = 0.005
         self.success_threshold = 0.8
