@@ -117,6 +117,9 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     offsets = offsets * scaling_repeat[:,:3]
     xyz = repeat_anchor + offsets
 
+    pc._offset_rot = rot
+    pc._offset_scaling = scaling
+
     if is_training:
         return xyz, color, opacity, scaling, rot, neural_opacity, mask
     else:

@@ -146,7 +146,7 @@ class OptimizationParams(ParamGroup):
         self.start_stat = 500
         self.update_from = 1500
         self.update_interval = 100
-        self.update_until = 15_000
+        self.update_until = 10_500
 
         self.start_cal_global_feat = 250
 

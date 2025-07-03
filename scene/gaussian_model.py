@@ -20,7 +20,7 @@ from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
-from utils.general_utils import strip_symmetric, build_scaling_rotation, get_free_gpu
+from utils.general_utils import strip_symmetric, build_scaling_rotation, get_free_gpu,eigh_in_batch
 from scene.embedding import Embedding
 import open3d as o3d
 from pointNN import Point_NN
@@ -97,6 +97,10 @@ class GaussianModel:
         self.gamma_21 = gamma_21
         self.gamma_32 = gamma_32
         self.min_neighbors = min_neighbors
+
+        # 增设用于记录高斯椭球中间状态的变量
+        self._offset_scaling = torch.empty(0)
+        self._offset_rot = torch.empty(0)
         
         self.opacity_accum = torch.empty(0)
 
@@ -287,6 +291,10 @@ class GaussianModel:
     @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
+
+    @property
+    def get_offset_scaling(self):
+        return self.scaling_activation(self._offset_scaling)
     
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
@@ -296,6 +304,12 @@ class GaussianModel:
         data = np.unique(np.round(data/voxel_size), axis=0)*voxel_size
         
         return data
+
+    def get_covariance_inv_matrix(self, scaling_modifier = 1):
+        L = build_scaling_rotation(scaling_modifier / (self.get_offset_scaling + 1e-8), self._offset_rot)
+        actual_covariance = L @ L.transpose(1, 2)
+        return actual_covariance
+
     
     def get_after_iss_anchors(self):
         points_tensor = self.get_anchor
@@ -394,7 +408,9 @@ class GaussianModel:
 
 
     def training_setup(self, training_args):
-        self.cauculate_and_set_pointNN_feat(c_points=self.get_anchor, opt=training_args)
+        if self.add_global_feat:
+            self.cauculate_and_set_pointNN_feat(c_points=self.get_anchor, opt=training_args)
+
         self._pointNN_feat = nn.Parameter(self._pointNN_feat.requires_grad_(False))
 
         self.percent_dense = training_args.percent_dense
@@ -405,7 +421,7 @@ class GaussianModel:
         self.offset_denom = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.anchor_demon = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
 
-        self.xyz_splitting_mat_accum = torch.zeros((self.get_anchor.shape[0], 3, 3), device="cuda")
+        self.offset_splitting_mats_accum = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 3, 3), device="cuda")
 
         
         
@@ -671,20 +687,15 @@ class GaussianModel:
         combined_mask[anchor_visible_mask] = offset_selection_mask
         temp_mask = combined_mask.clone()
         combined_mask[temp_mask] = update_filter
-        
-        print("viewspace_point_tensor grad shape: ", viewspace_point_tensor.grad.shape)
-        print("splitting_mats grad shape: ", splitting_mats.grad.shape)
+
         grad_norm = torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.offset_gradient_accum[combined_mask] += grad_norm
         self.offset_denom[combined_mask] += 1
 
+        dL_dG = splitting_mats.grad[update_filter][:, 0, 0]
+        self.offset_splitting_mats_accum[combined_mask] += dL_dG[:, None, None] * self.get_covariance_inv_matrix()[update_filter]
+        # self.offset_splitting_mats_accum[combined_mask] += splitting_mats.grad[update_filter, :3, :3]
 
-        self.offset_splitting_mats_accum[combined_mask] += splitting_mats.grad[update_filter]
-        print("successfully update offset_splitting_mats_accum")
-
-        
-
-        
     def _prune_anchor_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -731,6 +742,8 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+
+        self.offset_splitting_mats_accum = torch.zeros((self._anchor.shape[0] * self.n_offsets, 3, 3), device="cuda")
 
     
     def anchor_growing(self, grads, threshold, offset_mask):
@@ -838,10 +851,20 @@ class GaussianModel:
         grads[grads.isnan()] = 0.0
         grads_norm = torch.norm(grads, dim=-1)
         offset_mask = (self.offset_denom > check_interval*success_threshold*0.5).squeeze(dim=1)
+
+        splitting_mats = self.offset_splitting_mats_accum / self.offset_denom[..., None]
+        splitting_mats[splitting_mats.isnan()] = 0.0
+
+        with torch.no_grad():
+            S_eigvals, S_eigvecs = eigh_in_batch(splitting_mats, least_k=1)
+            S_eigvals, S_eigvecs = S_eigvals.squeeze(-1), S_eigvecs.squeeze(-1)
+
+        S_mask = S_eigvals <  -1e-6
+        selected_pts_mask = torch.logical_and(offset_mask, S_mask)
         
         print(f"Number of anchors before growing: {self.get_anchor.shape[0]}")
 
-        self.anchor_growing(grads_norm, grad_threshold, offset_mask)
+        self.anchor_growing(grads_norm, grad_threshold, selected_pts_mask)
 
         print(f"Number of anchors after growing: {self.get_anchor.shape[0]}")
         
@@ -891,6 +914,7 @@ class GaussianModel:
         if prune_mask.shape[0]>0:
             self.prune_anchor(prune_mask)
         print(f"Number of anchors after pruning: {self.get_anchor.shape[0]}")
+        print(f"offset_splitting_mats_accum.shape", self.offset_splitting_mats_accum.shape)
         
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
 

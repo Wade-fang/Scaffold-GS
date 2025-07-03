@@ -154,3 +154,19 @@ def get_free_gpu():
             best_gpu = i
     
     return torch.device(f'cuda:{best_gpu}')
+def eigh_in_batch(As, batch_size=1_000_000, least_k=-1):
+
+    assert As.shape[1] == As.shape[2]
+
+    out_eigvals = []
+    out_eigvecs = []
+
+    if least_k == -1:
+        least_k = As.shape[-1]
+
+    for A in torch.split(As, batch_size, dim=0):
+        eigvals, eigvecs = torch.linalg.eigh(A)
+        out_eigvals.append(eigvals[..., :least_k])
+        out_eigvecs.append(eigvecs[..., :, :least_k])
+
+    return torch.cat(out_eigvals, 0), torch.cat(out_eigvecs, 0)

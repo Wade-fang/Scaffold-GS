@@ -17,8 +17,11 @@ cmd = 'nvidia-smi -q -d Memory |grep -A4 GPU|grep Used'
 result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).stdout.decode().split('\n')
 gpu_memory_usage = [int(x.split()[2]) for x in result[:-1]]
 # 获取内存使用量最少的两个GPU的索引
-two_least_used_gpus = np.argsort(gpu_memory_usage)[:2]
-os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, two_least_used_gpus))
+# two_least_used_gpus = np.argsort(gpu_memory_usage)[:2]
+# os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, two_least_used_gpus))
+
+# 使用索引号为1的GPU
+os.environ['CUDA_VISIBLE_DEVICES'] = '2'  # Change this to the desired GPU index
 
 os.system('echo $CUDA_VISIBLE_DEVICES')
 
